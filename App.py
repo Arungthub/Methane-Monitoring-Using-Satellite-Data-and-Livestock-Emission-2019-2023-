@@ -8,6 +8,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import tempfile
+import os
 
 st.set_page_config(layout="wide")
 st.title("Global Methane Monitoring Dashboard")
@@ -44,17 +46,56 @@ live_file = st.sidebar.file_uploader(
 
 if st.sidebar.button("Process Data"):
 
+    if not sat_files:
+        st.sidebar.error("Please upload at least one .nc satellite file.")
+        st.stop()
+
+    if not live_file:
+        st.sidebar.error("Please upload the FAOSTAT CSV file.")
+        st.stop()
+
     # --- Process Satellite ---
     records = []
-    for file in sat_files:
+    errors = []
+
+    progress = st.sidebar.progress(0, text="Processing satellite files...")
+
+    for i, file in enumerate(sat_files):
         try:
-            ds = xr.open_dataset(file, group="PRODUCT")
+            # Write uploaded file to a temp file on disk (fixes xarray AxiosError with large files)
+            with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
+                tmp.write(file.read())
+                tmp_path = tmp.name
+
+            ds = xr.open_dataset(tmp_path, group="PRODUCT")
             ch4 = ds["methane_mixing_ratio_bias_corrected"]
             mean_val = float(np.nanmean(ch4.values))
             date_str = str(ds["time"].values[0])[:7]
             records.append([date_str, mean_val])
-        except:
+            ds.close()
+            os.unlink(tmp_path)
+
+        except Exception as e:
+            errors.append(f"{file.name}: {str(e)}")
+            # Clean up temp file if it exists
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
             continue
+
+        progress.progress((i + 1) / len(sat_files), text=f"Processing file {i+1} of {len(sat_files)}...")
+
+    progress.empty()
+
+    if errors:
+        with st.sidebar.expander(f"⚠️ {len(errors)} file(s) failed"):
+            for e in errors:
+                st.write(e)
+
+    if not records:
+        st.sidebar.error("No satellite files could be processed. Check file format.")
+        st.stop()
 
     atmos_df = pd.DataFrame(records, columns=["Date", "Atmosphere_ppb"])
     atmos_df["Date"] = pd.to_datetime(atmos_df["Date"])
@@ -62,9 +103,13 @@ if st.sidebar.button("Process Data"):
     yearly_atmos = atmos_df.groupby("Year")["Atmosphere_ppb"].mean().reset_index()
 
     # --- Process Livestock ---
-    livestock_df = pd.read_csv(live_file)
-    livestock_df = livestock_df[["Area", "Year", "Value"]]
-    livestock_df = livestock_df.rename(columns={"Value": "Livestock_kt"})
+    try:
+        livestock_df = pd.read_csv(live_file)
+        livestock_df = livestock_df[["Area", "Year", "Value"]]
+        livestock_df = livestock_df.rename(columns={"Value": "Livestock_kt"})
+    except Exception as e:
+        st.sidebar.error(f"Failed to read FAOSTAT CSV: {e}")
+        st.stop()
 
     livestock_yearly = livestock_df.groupby("Year")["Livestock_kt"].sum().reset_index()
 
@@ -72,11 +117,15 @@ if st.sidebar.button("Process Data"):
     merged_df = merged_df.sort_values("Year").reset_index(drop=True)
     merged_df["Time_Index"] = range(len(merged_df))
 
+    if merged_df.empty:
+        st.sidebar.error("No overlapping years found between satellite and livestock data.")
+        st.stop()
+
     st.session_state.merged_df = merged_df
     st.session_state.livestock_df = livestock_df
     st.session_state.yearly_atmos = yearly_atmos
 
-    st.sidebar.success("Data processed successfully!")
+    st.sidebar.success(f"✅ Processed {len(records)} satellite files successfully!")
 
 # =====================================================
 # PAGE CONTENT
