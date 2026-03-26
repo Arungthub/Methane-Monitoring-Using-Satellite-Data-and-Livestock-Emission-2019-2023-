@@ -6,3 +6,4 @@ plotly
 seaborn
 matplotlib
 scikit-learn
+netCDF4
